@@ -1,0 +1,6 @@
+# python
+*.pyc
+
+# pytorch
+model/*
+*.pt*
