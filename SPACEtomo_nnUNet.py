@@ -39,6 +39,85 @@ os.environ["nnUNet_results"] = CUR_DIR
 
 from nnunetv2.inference import predict_from_raw_data as predict
 
+# TODO: move to separate file
+class SegmentationModel:
+    def __init__(self, path: str, folds: list[int], checkpoint: str = "checkpoint_final.pth"):
+        self.path = path
+        self.folds = folds
+        self.checkpoint = checkpoint
+
+        self.device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu') # dynamically set device
+        self.is_cuda_device = True if self.device.type == "cuda" else False 
+        self.dtype=np.float16 if self.is_cuda_device else np.float32  # half precision for cuda only
+
+        self.load_model()
+
+    def load_model(self) -> predict.nnUNetPredictor: 
+        """Loads the nnUNet model from the given path and folds."""
+        predictor = predict.nnUNetPredictor(
+            tile_step_size=0.5,
+            perform_everything_on_gpu=self.is_cuda_device,
+            device=self.device,
+            allow_tqdm=False
+        )
+
+        predictor.initialize_from_trained_model_folder(
+            self.path,
+            self.folds,
+            checkpoint_name=self.checkpoint
+        )
+
+        logging.info("Model loaded.")
+        self.predictor = predictor  
+        
+        return self.predictor
+
+    def preprocess(self, image: np.ndarray) -> np.ndarray:
+        """"Preprocess image for nnUNet"""
+        image = np.array(image, dtype=self.dtype)[np.newaxis, np.newaxis, :, :]
+        return image
+
+    def inference(self, image: np.ndarray,  out_name: str) -> np.ndarray:
+        """Runs the nnUNet model on the given image and saves the result to the given output name."""
+        logging.info("Starting prediction...")
+        image = self.preprocess(image)
+
+        # TODO: fix the return values, so they return mask, scores
+        self.predictor.predict_single_npy_array(
+            input_image=image, 
+            image_properties={"spacing": [999, 1, 1]},
+            output_file_truncated=out_name,
+        )
+
+        # return mask
+
+class DetectionModel:
+    def __init__(self, path: str):
+        self.path = path
+        self.model = YOLO(path)
+
+    def inference(self, image: np.ndarray) -> np.ndarray:
+        # Do YOLO inference
+        results = self.model(image)
+        return results
+
+def preprocess_image(image: np.ndarray, seg_pixel_size: float, det_pixel_size: float) -> np.ndarray:
+    full_shape = np.array(image.shape)
+    division = np.round(full_shape * seg_pixel_size / det_pixel_size).astype(int)
+    pixel_shape = full_shape // division
+    pixel_map = np.zeros(division)
+    for i in range(division[0]):
+        for j in range(division[1]):
+            pixel = image[i * pixel_shape[0]:(i + 1) * pixel_shape[0], j * pixel_shape[1]:(j + 1) * pixel_shape[1]]
+            pixel_map[i, j] = np.mean(pixel)
+    # Add padding to emulate grid map
+    padded_map = np.zeros((config.WG_model_sidelen, config.WG_model_sidelen))
+    padded_map[0: pixel_map.shape[0], 0: pixel_map.shape[1]] = pixel_map
+    yolo_input = np.dstack([padded_map, padded_map, padded_map])
+
+    return yolo_input, full_shape, pixel_shape
+
+
 # Start log file
 logging.basicConfig(filename=os.path.splitext(montage_file)[0] + "_SPACE.log", level=logging.INFO, format='')
 logging.info("Processing " + montage_file)
@@ -55,7 +134,7 @@ classes = dataset_json["labels"]
 logging.info("Loaded class labels.")
 
 # Load YOLO model
-WG_model = YOLO(os.path.join(SPACE_DIR, config.WG_model_file))  # load a custom model
+detection_model = DetectionModel(os.path.join(SPACE_DIR, config.WG_model_file))  # load a custom model
 settings.update({'sync': False})    # no tracking by google analytics
 
 # Load map
@@ -65,21 +144,12 @@ time_point1 = time.time()
 logging.info("Map was loaded in " + str(int(time_point1 - start_time)) + " s.")
 
 # Rescale map for YOLO lamella bbox detection
-full_shape = np.array(montage_map.shape)
-division = np.round(full_shape * config.MM_model_pix_size / config.WG_model_pix_size).astype(int)
-pixel_shape = full_shape // division
-pixel_map = np.zeros(division)
-for i in range(division[0]):
-    for j in range(division[1]):
-        pixel = montage_map[i * pixel_shape[0]:(i + 1) * pixel_shape[0], j * pixel_shape[1]:(j + 1) * pixel_shape[1]]
-        pixel_map[i, j] = np.mean(pixel)
-# Add padding to emulate grid map
-padded_map = np.zeros((config.WG_model_sidelen, config.WG_model_sidelen))
-padded_map[0: pixel_map.shape[0], 0: pixel_map.shape[1]] = pixel_map
+yolo_input, full_shape, pixel_shape = preprocess_image(montage_map, 
+                                                       seg_pixel_size=config.MM_model_pix_size, 
+                                                       det_pixel_size=config.WG_model_pix_size)
 
 # Run YOLO model to detect bbox
-yolo_input = np.dstack([padded_map, padded_map, padded_map])
-results = WG_model(yolo_input)
+results = detection_model.inference(yolo_input)
 
 # Check and upscale resulting box
 if len(results[0].boxes) > 0:
@@ -110,40 +180,16 @@ else:
     logging.info("WARNING: No bounding box was detected in " + str(int(time_point2 - time_point1)) + " s.")
     logging.info("Using whole montage map...")
 
-# Setup input and output for nnUNet
-device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu') # dynamically set device
-is_cuda_device = True if device.type == "cuda" else False 
-dtype=np.float16 if is_cuda_device else np.float32  # half precision for cuda only
-input_img = np.array(crop, dtype=dtype)[np.newaxis, np.newaxis, :, :]
-
+    
 # Use temp name to pad later
-if bounds is None:
-    out_name = os.path.splitext(montage_file)[0] + "_seg"
-else:
-    out_name = os.path.splitext(montage_file)[0] + "_segtemp"
+out_name = os.path.splitext(montage_file)[0] + "_seg"
 
-# Do nnUNet inference
-predictor = predict.nnUNetPredictor(
-    tile_step_size=0.5,
-    perform_everything_on_gpu=is_cuda_device,
-    device=device,
-    allow_tqdm=False
-)
+if bounds is not None:
+    out_name += "temp"
 
-predictor.initialize_from_trained_model_folder(
-    os.path.join(SPACE_DIR, config.MM_model_folder),
-    config.MM_model_folds,
-    checkpoint_name="checkpoint_final.pth"
-)
-
-logging.info("Model loaded.")
-logging.info("Starting prediction...")
-
-predictor.predict_single_npy_array(
-    input_image=input_img, 
-    image_properties={"spacing": [999, 1, 1]},
-    output_file_truncated=out_name,
-)
+# Run segmentation model
+model = SegmentationModel(os.path.join(SPACE_DIR, config.MM_model_folder), config.MM_model_folds)
+mask = model.inference(crop, out_name)
 
 logging.info("Postprocessing...")
 
